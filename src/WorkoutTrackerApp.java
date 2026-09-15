@@ -637,11 +637,11 @@ public class WorkoutTrackerApp {
                                     <th>Rep Floor</th>
                                     <th>Rep Ceiling</th>
                                     <th>Target Weight</th>
-                                    <th>Last Max Reps</th>
-                                    <th>Set 1</th>
-                                    <th>Set 2</th>
-                                    <th>Set 3</th>
-                                    <th>Set 4</th>
+//                                    <th>Last Max Reps</th>
+//                                    <th>Set 1</th>
+//                                    <th>Set 2</th>
+//                                    <th>Set 3</th>
+//                                    <th>Set 4</th>
                                 </tr>
                             </thead>
                             <tbody id=\"exerciseRows\"></tbody>
