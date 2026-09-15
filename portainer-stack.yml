@@ -1,0 +1,15 @@
+version: "3.9"
+
+services:
+  workout-tracker:
+    image: workout-tracker:latest
+    container_name: workout-tracker
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - workout-tracker-data:/app/data
+
+volumes:
+  workout-tracker-data:
+    driver: local
