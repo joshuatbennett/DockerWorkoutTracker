@@ -1,6 +1,8 @@
 services:
   workout-tracker:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: workout-tracker
     restart: unless-stopped
     environment:
