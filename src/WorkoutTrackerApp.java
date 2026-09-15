@@ -48,10 +48,12 @@ public class WorkoutTrackerApp {
 
     private void serveWorkoutPlan(HttpExchange exchange) throws IOException {
         LocalDate today = LocalDate.now();
-        List<ExerciseTemplate> templates = getExercisesForDay(today.getDayOfWeek());
+        String selectedRoutine = resolveRoutineFromQuery(exchange);
+        List<ExerciseTemplate> templates = getExercisesForRoutine(selectedRoutine);
         StringBuilder json = new StringBuilder();
         json.append("{\"date\":\"").append(today.format(FILE_DATE_FORMAT)).append("\",");
         json.append("\"day\":\"").append(formatDayName(today.getDayOfWeek())).append("\",");
+        json.append("\"routine\":\"").append(selectedRoutine).append("\",");
         json.append("\"exercises\":[");
 
         for (int i = 0; i < templates.size(); i++) {
@@ -62,15 +64,50 @@ public class WorkoutTrackerApp {
             }
             json.append("{\"name\":\"").append(template.name).append("\",");
             json.append("\"sets\":").append(template.sets).append(",");
-            json.append("\"minReps\":").append(template.minReps).append(",");
-            json.append("\"maxReps\":").append(template.maxReps).append(",");
+            json.append("\"repFloor\":").append(template.repFloor).append(",");
+            json.append("\"repCeiling\":").append(template.repCeiling).append(",");
             json.append("\"targetWeight\":").append(plan.targetWeight).append(",");
             json.append("\"lastWeight\":").append(plan.lastWeight).append(",");
-            json.append("\"lastReps\":").append(plan.lastReps).append("}");
+            json.append("\"lastMaxReps\":").append(plan.lastMaxReps).append("}");
         }
         json.append("]}");
 
         sendResponse(exchange, 200, "application/json; charset=UTF-8", json.toString());
+    }
+
+    private String resolveRoutineFromQuery(HttpExchange exchange) {
+        String query = exchange.getRequestURI().getRawQuery();
+        if (query == null || query.isBlank()) {
+            return getRoutineForDay(LocalDate.now().getDayOfWeek());
+        }
+
+        for (String param : query.split("&")) {
+            String[] pair = param.split("=", 2);
+            if (pair.length == 2 && "routine".equals(pair[0])) {
+                String value = URLDecoder.decode(pair[1], StandardCharsets.UTF_8);
+                if (value != null && !value.isBlank()) {
+                    return value;
+                }
+            }
+        }
+
+        return getRoutineForDay(LocalDate.now().getDayOfWeek());
+    }
+
+    private String getRoutineForDay(DayOfWeek day) {
+        if (day == DayOfWeek.MONDAY) {
+            return "Upper 1";
+        }
+        if (day == DayOfWeek.TUESDAY) {
+            return "Lower 1";
+        }
+        if (day == DayOfWeek.THURSDAY) {
+            return "Upper 2";
+        }
+        if (day == DayOfWeek.FRIDAY) {
+            return "Lower 2";
+        }
+        return "Upper 1";
     }
 
     private void saveWorkoutLog(HttpExchange exchange) throws IOException {
@@ -80,6 +117,7 @@ public class WorkoutTrackerApp {
         }
 
         String rawBody = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+        String selectedRoutine = resolveRoutineFromFormBody(rawBody);
         List<ExerciseLog> logs = parseWorkoutBody(rawBody);
         if (logs.isEmpty()) {
             sendResponse(exchange, 400, "application/json; charset=UTF-8", "{\"success\":false,\"message\":\"No workout data was received\"}");
@@ -87,12 +125,34 @@ public class WorkoutTrackerApp {
         }
 
         LocalDate today = LocalDate.now();
-        WorkoutEntry entry = new WorkoutEntry(today, today.getDayOfWeek().name());
+        String entryDayName = selectedRoutine != null && !selectedRoutine.isBlank() ? selectedRoutine : today.getDayOfWeek().name();
+        WorkoutEntry entry = new WorkoutEntry(today, entryDayName);
         entry.exercises.addAll(logs);
         workouts.add(entry);
         saveWorkouts();
 
         sendResponse(exchange, 200, "application/json; charset=UTF-8", "{\"success\":true,\"message\":\"Workout saved\"}");
+    }
+
+    private String resolveRoutineFromFormBody(String rawBody) {
+        if (rawBody == null || rawBody.isBlank()) {
+            return null;
+        }
+        try {
+            String decoded = URLDecoder.decode(rawBody, StandardCharsets.UTF_8);
+            for (String pair : decoded.split("&")) {
+                String[] values = pair.split("=", 2);
+                if (values.length == 2 && "routine".equals(values[0])) {
+                    String value = values[1].replace('+', ' ').trim();
+                    if (!value.isEmpty()) {
+                        return value;
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+            return null;
+        }
+        return null;
     }
 
     private void serveHistory(HttpExchange exchange) throws IOException {
@@ -109,7 +169,14 @@ public class WorkoutTrackerApp {
                 if (j > 0) {
                     json.append(",");
                 }
-                json.append("{\"name\":\"").append(log.exerciseName).append("\",\"weight\":").append(log.weight).append(",\"reps\":").append(log.reps).append(",\"sets\":").append(log.sets).append("}");
+                json.append("{\"name\":\"").append(log.exerciseName).append("\",\"reps\":[");
+                for (int k = 0; k < log.repsBySet.size(); k++) {
+                    if (k > 0) {
+                        json.append(",");
+                    }
+                    json.append(log.repsBySet.get(k));
+                }
+                json.append("]}");
             }
             json.append("]}");
         }
@@ -131,18 +198,22 @@ public class WorkoutTrackerApp {
                 if (values.length != 2 || values[0].isBlank()) {
                     continue;
                 }
-
-                String exerciseName = values[0].replace("+", " ");
-                String[] parts = values[1].split("\\|");
-                if (parts.length != 3) {
+                if ("routine".equals(values[0])) {
                     continue;
                 }
 
-                double weight = Double.parseDouble(parts[0]);
-                int reps = Integer.parseInt(parts[1]);
-                int sets = Integer.parseInt(parts[2]);
-                if (weight > 0) {
-                    logs.add(new ExerciseLog(exerciseName, weight, reps, sets));
+                String exerciseName = values[0].replace("+", " ");
+                String[] repValues = values[1].split("\\|");
+                List<Integer> reps = new ArrayList<>();
+                for (String repValue : repValues) {
+                    String trimmed = repValue.trim();
+                    if (trimmed.isEmpty()) {
+                        continue;
+                    }
+                    reps.add(Integer.parseInt(trimmed));
+                }
+                if (!reps.isEmpty()) {
+                    logs.add(new ExerciseLog(exerciseName, reps));
                 }
             }
         } catch (Exception ignored) {
@@ -185,10 +256,23 @@ public class WorkoutTrackerApp {
 
                 for (int i = 2; i < columns.length; i++) {
                     String[] parts = columns[i].split("~");
-                    if (parts.length < 4) {
+                    if (parts.length < 2) {
                         continue;
                     }
-                    entry.exercises.add(new ExerciseLog(parts[0], Double.parseDouble(parts[1]), Integer.parseInt(parts[2]), Integer.parseInt(parts[3])));
+
+                    String exerciseName = parts[0];
+                    List<Integer> repsBySet = new ArrayList<>();
+                    for (int j = 1; j < parts.length; j++) {
+                        String[] repValues = parts[j].split("\\|");
+                        for (String repValue : repValues) {
+                            if (!repValue.isBlank()) {
+                                repsBySet.add(Integer.parseInt(repValue));
+                            }
+                        }
+                    }
+                    if (!repsBySet.isEmpty()) {
+                        entry.exercises.add(new ExerciseLog(exerciseName, repsBySet));
+                    }
                 }
 
                 workouts.add(entry);
@@ -210,7 +294,13 @@ public class WorkoutTrackerApp {
                 StringBuilder line = new StringBuilder();
                 line.append(entry.date.format(FILE_DATE_FORMAT)).append("|").append(entry.dayName);
                 for (ExerciseLog log : entry.exercises) {
-                    line.append("|").append(log.exerciseName).append("~").append(log.weight).append("~").append(log.reps).append("~").append(log.sets);
+                    line.append("|").append(log.exerciseName).append("~");
+                    for (int i = 0; i < log.repsBySet.size(); i++) {
+                        if (i > 0) {
+                            line.append("|");
+                        }
+                        line.append(log.repsBySet.get(i));
+                    }
                 }
                 lines.add(line.toString());
             }
@@ -227,12 +317,44 @@ public class WorkoutTrackerApp {
         }
 
         double targetWeight = last.weight;
-        if (last.reps >= template.maxReps && last.sets >= template.sets) {
+        if (last.repsBySet.size() >= template.sets && allRepsAtOrAboveTarget(last.repsBySet, template.repFloor)) {
             targetWeight = roundToHalf(last.weight + template.incrementLb);
-        } else if (last.reps < template.minReps || last.sets < template.sets) {
+        } else if (last.repsBySet.size() < template.sets || hasAnyRepBelowTarget(last.repsBySet, template.repFloor)) {
             targetWeight = roundToHalf(last.weight);
         }
-        return new ProgressionPlan(targetWeight, last.weight, last.reps);
+
+        return new ProgressionPlan(targetWeight, last.weight, maxReps(last.repsBySet));
+    }
+
+    private boolean allRepsAtOrAboveTarget(List<Integer> repsBySet, int targetReps) {
+        if (repsBySet.isEmpty()) {
+            return false;
+        }
+        for (int reps : repsBySet) {
+            if (reps < targetReps) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean hasAnyRepBelowTarget(List<Integer> repsBySet, int targetReps) {
+        for (int reps : repsBySet) {
+            if (reps < targetReps) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private int maxReps(List<Integer> repsBySet) {
+        int max = 0;
+        for (int reps : repsBySet) {
+            if (reps > max) {
+                max = reps;
+            }
+        }
+        return max;
     }
 
     private ExerciseLog findMostRecentLog(String exerciseName) {
@@ -249,18 +371,28 @@ public class WorkoutTrackerApp {
     }
 
     private List<ExerciseTemplate> getExercisesForDay(DayOfWeek dayOfWeek) {
-        List<ExerciseTemplate> templates = new ArrayList<>();
-        for (ExerciseTemplate template : DEFAULT_PLAN) {
-            if (template.days.contains(dayOfWeek)) {
-                templates.add(template);
-            }
+        String routine = getRoutineForDay(dayOfWeek);
+        return getExercisesForRoutine(routine);
+    }
+
+    private List<ExerciseTemplate> getExercisesForRoutine(String routineName) {
+        switch (routineName) {
+            case "Upper 1":
+                return new ArrayList<>(UPPER_1_PLAN);
+            case "Upper 2":
+                return new ArrayList<>(UPPER_2_PLAN);
+            case "Lower 1":
+                return new ArrayList<>(LOWER_1_PLAN);
+            case "Lower 2":
+                return new ArrayList<>(LOWER_2_PLAN);
+            default:
+                return new ArrayList<>(UPPER_1_PLAN);
         }
-        return templates;
     }
 
     private static String formatDayName(DayOfWeek day) {
         String value = day.name();
-        return value.substring(0, 1) + value.substring(1).toLowerCase();
+        return value.substring(0, 1).toUpperCase() + value.substring(1).toLowerCase();
     }
 
     private static double roundToHalf(double value) {
@@ -276,27 +408,33 @@ public class WorkoutTrackerApp {
         }
     }
 
-    private static final List<ExerciseTemplate> DEFAULT_PLAN = List.of(
+    private static final List<ExerciseTemplate> UPPER_1_PLAN = List.of(
             new ExerciseTemplate("Barbell Bench Press", 4, 5, 5, 5.0, 115.0, DayOfWeek.MONDAY),
             new ExerciseTemplate("Barbell Bent-Over Row", 4, 5, 5, 5.0, 125.0, DayOfWeek.MONDAY),
             new ExerciseTemplate("Landmine Press", 3, 6, 8, 5.0, 45.0, DayOfWeek.MONDAY),
             new ExerciseTemplate("Cable Lat Pulldown", 4, 6, 8, 5.0, 80.0, DayOfWeek.MONDAY),
             new ExerciseTemplate("Cable Triceps Pushdown", 3, 10, 12, 2.5, 35.0, DayOfWeek.MONDAY),
-            new ExerciseTemplate("Cable Curl", 3, 10, 12, 2.5, 35.0, DayOfWeek.MONDAY),
+            new ExerciseTemplate("Cable Curl", 3, 10, 12, 2.5, 35.0, DayOfWeek.MONDAY)
+    );
 
+    private static final List<ExerciseTemplate> LOWER_1_PLAN = List.of(
             new ExerciseTemplate("Barbell Back Squat", 4, 5, 5, 10.0, 185.0, DayOfWeek.TUESDAY),
             new ExerciseTemplate("Romanian Deadlift", 4, 6, 6, 5.0, 155.0, DayOfWeek.TUESDAY),
             new ExerciseTemplate("Bulgarian Split Squat", 3, 8, 8, 5.0, 40.0, DayOfWeek.TUESDAY),
             new ExerciseTemplate("Hanging Leg Raise", 3, 10, 15, 0.0, 0.0, DayOfWeek.TUESDAY),
-            new ExerciseTemplate("Cable Pull-Through", 3, 12, 15, 2.5, 55.0, DayOfWeek.TUESDAY),
+            new ExerciseTemplate("Cable Pull-Through", 3, 12, 15, 2.5, 55.0, DayOfWeek.TUESDAY)
+    );
 
+    private static final List<ExerciseTemplate> UPPER_2_PLAN = List.of(
             new ExerciseTemplate("Incline Barbell Bench Press", 4, 8, 10, 5.0, 95.0, DayOfWeek.THURSDAY),
             new ExerciseTemplate("Cable Lat Pulldown", 4, 8, 10, 5.0, 70.0, DayOfWeek.THURSDAY),
             new ExerciseTemplate("Cable Seated Row", 3, 10, 12, 2.5, 60.0, DayOfWeek.THURSDAY),
             new ExerciseTemplate("Cable Face Pull", 3, 12, 15, 2.5, 25.0, DayOfWeek.THURSDAY),
             new ExerciseTemplate("Cable Lateral Raise", 3, 12, 15, 2.5, 15.0, DayOfWeek.THURSDAY),
-            new ExerciseTemplate("Close-Grip Bench Press", 3, 8, 10, 5.0, 95.0, DayOfWeek.THURSDAY),
+            new ExerciseTemplate("Close-Grip Bench Press", 3, 8, 10, 5.0, 95.0, DayOfWeek.THURSDAY)
+    );
 
+    private static final List<ExerciseTemplate> LOWER_2_PLAN = List.of(
             new ExerciseTemplate("Front Squat", 4, 6, 8, 10.0, 135.0, DayOfWeek.FRIDAY),
             new ExerciseTemplate("Barbell Reverse Lunge", 3, 10, 10, 5.0, 45.0, DayOfWeek.FRIDAY),
             new ExerciseTemplate("Barbell Hip Thrust", 3, 10, 12, 5.0, 135.0, DayOfWeek.FRIDAY),
@@ -315,13 +453,13 @@ public class WorkoutTrackerApp {
                 <style>
                     :root { color-scheme: light dark; }
                     body { font-family: Arial, sans-serif; margin: 0; background: #0f172a; color: #e2e8f0; }
-                    .container { max-width: 1000px; margin: 40px auto; padding: 20px; }
+                    .container { max-width: 1200px; margin: 40px auto; padding: 20px; }
                     h1 { margin-bottom: 8px; }
                     .meta { color: #cbd5e1; margin-bottom: 20px; }
                     table { width: 100%; border-collapse: collapse; margin-top: 16px; }
-                    th, td { border: 1px solid #334155; padding: 12px; text-align: left; }
+                    th, td { border: 1px solid #334155; padding: 10px; text-align: center; }
                     th { background: #1e293b; }
-                    input { width: 100%; box-sizing: border-box; padding: 8px; border-radius: 6px; border: 1px solid #475569; background: #0f172a; color: #f8fafc; }
+                    input { width: 100%; box-sizing: border-box; padding: 8px; border-radius: 6px; border: 1px solid #475569; background: #0f172a; color: #f8fafc; text-align: center; }
                     button { background: #22c55e; color: #052e16; border: none; border-radius: 8px; padding: 10px 18px; font-weight: bold; cursor: pointer; }
                     .status { margin-top: 20px; min-height: 24px; color: #86efac; }
                     .error { color: #fca5a5; }
@@ -331,17 +469,29 @@ public class WorkoutTrackerApp {
                 <div class=\"container\">
                     <h1>Workout Tracker</h1>
                     <div id=\"dayMeta\" class=\"meta\"></div>
+                    <div style=\"margin-bottom: 16px;\">
+                        <label for=\"routineSelect\">Workout: </label>
+                        <select id=\"routineSelect\" style=\"padding: 8px; border-radius: 6px; background: #0f172a; color: #f8fafc; border: 1px solid #475569;\">
+                            <option value=\"Upper 1\">Upper 1</option>
+                            <option value=\"Upper 2\">Upper 2</option>
+                            <option value=\"Lower 1\">Lower 1</option>
+                            <option value=\"Lower 2\">Lower 2</option>
+                        </select>
+                    </div>
                     <form id=\"workoutForm\">
                         <table>
                             <thead>
                                 <tr>
                                     <th>Exercise</th>
-                                    <th>Sets</th>
-                                    <th>Reps</th>
-                                    <th>Target</th>
-                                    <th>Last Weight</th>
-                                    <th>Last Reps</th>
-                                    <th>Weight Used</th>
+                                    <th>Target Sets</th>
+                                    <th>Rep Floor</th>
+                                    <th>Rep Ceiling</th>
+                                    <th>Target Weight</th>
+                                    <th>Last Max Reps</th>
+                                    <th>Set 1</th>
+                                    <th>Set 2</th>
+                                    <th>Set 3</th>
+                                    <th>Set 4</th>
                                 </tr>
                             </thead>
                             <tbody id=\"exerciseRows\"></tbody>
@@ -355,54 +505,74 @@ public class WorkoutTrackerApp {
 
                 <script>
                     async function loadPlan() {
-                        const response = await fetch('/api/workout-plan');
+                        const routine = document.getElementById('routineSelect').value;
+                        const response = await fetch('/api/workout-plan?routine=' + encodeURIComponent(routine));
                         const plan = await response.json();
                         const rows = document.getElementById('exerciseRows');
                         const meta = document.getElementById('dayMeta');
-                        meta.textContent = `${plan.day} • ${plan.date}`;
+                        const routineSelect = document.getElementById('routineSelect');
+                        routineSelect.value = plan.routine || routine;
+                        meta.textContent = `${plan.day} • ${plan.date} • ${plan.routine}`;
                         rows.innerHTML = '';
 
                         if (!plan.exercises || plan.exercises.length === 0) {
-                            rows.innerHTML = '<tr><td colspan="7">Rest day — recovery, mobility, and light cardio recommended.</td></tr>';
+                            rows.innerHTML = '<tr><td colspan="10">Rest day — recovery, mobility, and light cardio recommended.</td></tr>';
                             return;
                         }
 
                         plan.exercises.forEach((exercise) => {
-                            const repText = exercise.maxReps === exercise.minReps ? `${exercise.minReps}` : `${exercise.minReps}-${exercise.maxReps}`;
                             const row = document.createElement('tr');
+                            const setInputs = [];
+                            for (let i = 0; i < exercise.sets; i++) {
+                                setInputs.push(`<td><input type=\"number\" min=\"0\" max=\"30\" step=\"1\" data-name=\"${exercise.name}\" data-set-index=\"${i}\" placeholder=\"${i + 1}\" /></td>`);
+                            }
                             row.innerHTML = `
                                 <td>${exercise.name}</td>
                                 <td>${exercise.sets}</td>
-                                <td>${repText}</td>
+                                <td>${exercise.repFloor}</td>
+                                <td>${exercise.repCeiling}</td>
                                 <td>${exercise.targetWeight} lb</td>
-                                <td>${exercise.lastWeight || 0} lb</td>
-                                <td>${exercise.lastReps || 0}</td>
-                                <td><input type=\"number\" min=\"0\" step=\"2.5\" name=\"${exercise.name}\" data-name=\"${exercise.name}\" placeholder=\"lb\" /></td>
+                                <td>${exercise.lastMaxReps || 0}</td>
+                                ${setInputs.join('')}
                             `;
                             rows.appendChild(row);
                         });
                     }
 
+                    document.getElementById('routineSelect').addEventListener('change', loadPlan);
+
                     document.getElementById('workoutForm').addEventListener('submit', async (event) => {
                         event.preventDefault();
                         const inputs = document.querySelectorAll('input[data-name]');
                         const params = new URLSearchParams();
+                        const groups = {};
 
                         inputs.forEach((input) => {
-                            const weight = Number(input.value);
-                            if (!isNaN(weight) && weight > 0) {
-                                const reps = Number(prompt(`How many reps did you complete for ${input.dataset.name}?`, '5')) || 0;
-                                const sets = Number(prompt(`How many sets did you complete for ${input.dataset.name}?`, '1')) || 0;
-                                params.append(input.dataset.name, `${weight}|${reps}|${sets}`);
+                            const value = Number(input.value);
+                            if (!isNaN(value) && value >= 0) {
+                                const key = input.dataset.name;
+                                if (!groups[key]) {
+                                    groups[key] = [];
+                                }
+                                groups[key].push(value);
+                            }
+                        });
+
+                        Object.entries(groups).forEach(([exerciseName, values]) => {
+                            const setValues = values.filter((value) => value >= 0);
+                            if (setValues.length > 0) {
+                                params.append(exerciseName, setValues.join('|'));
                             }
                         });
 
                         const status = document.getElementById('status');
-                        if (params.toString() === '') {
-                            status.textContent = 'No weight entered. Nothing was saved.';
+                        if (Object.keys(groups).length === 0) {
+                            status.textContent = 'No reps entered. Nothing was saved.';
                             status.classList.add('error');
                             return;
                         }
+
+                        params.append('routine', document.getElementById('routineSelect').value);
 
                         const response = await fetch('/api/log-workout', {
                             method: 'POST',
@@ -431,30 +601,20 @@ public class WorkoutTrackerApp {
     public static class ExerciseTemplate {
         private final String name;
         private final int sets;
-        private final int minReps;
-        private final int maxReps;
+        private final int repFloor;
+        private final int repCeiling;
         private final double incrementLb;
         private final double baseWeight;
         private final List<DayOfWeek> days;
 
-        public ExerciseTemplate(String name, int sets, int minReps, int maxReps, double incrementLb, double baseWeight, DayOfWeek day) {
+        public ExerciseTemplate(String name, int sets, int repFloor, int repCeiling, double incrementLb, double baseWeight, DayOfWeek day) {
             this.name = name;
             this.sets = sets;
-            this.minReps = minReps;
-            this.maxReps = maxReps;
+            this.repFloor = repFloor;
+            this.repCeiling = repCeiling;
             this.incrementLb = incrementLb;
             this.baseWeight = baseWeight;
             this.days = List.of(day);
-        }
-
-        public ExerciseTemplate(String name, int sets, int minReps, int maxReps, double incrementLb, double baseWeight, DayOfWeek... days) {
-            this.name = name;
-            this.sets = sets;
-            this.minReps = minReps;
-            this.maxReps = maxReps;
-            this.incrementLb = incrementLb;
-            this.baseWeight = baseWeight;
-            this.days = List.of(days);
         }
     }
 
@@ -477,26 +637,24 @@ public class WorkoutTrackerApp {
     public static class ExerciseLog {
         private final String exerciseName;
         private final double weight;
-        private final int reps;
-        private final int sets;
+        private final List<Integer> repsBySet;
 
-        public ExerciseLog(String exerciseName, double weight, int reps, int sets) {
+        public ExerciseLog(String exerciseName, List<Integer> repsBySet) {
             this.exerciseName = exerciseName;
-            this.weight = weight;
-            this.reps = reps;
-            this.sets = sets;
+            this.weight = 0.0;
+            this.repsBySet = new ArrayList<>(repsBySet);
         }
     }
 
     public static class ProgressionPlan {
         private final double targetWeight;
         private final double lastWeight;
-        private final int lastReps;
+        private final int lastMaxReps;
 
-        public ProgressionPlan(double targetWeight, double lastWeight, int lastReps) {
+        public ProgressionPlan(double targetWeight, double lastWeight, int lastMaxReps) {
             this.targetWeight = targetWeight;
             this.lastWeight = lastWeight;
-            this.lastReps = lastReps;
+            this.lastMaxReps = lastMaxReps;
         }
     }
 }
