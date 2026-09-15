@@ -42,11 +42,35 @@ Run the container:
 docker run --rm -p 8080:8080 -v "$(pwd)/data:/app/data" workout-tracker
 ```
 
-This keeps the workout history in a local `data` folder on the host so it persists between container restarts.
+This keeps the SQLite database in a local `data` folder on the host so it persists between container restarts.
+
+The app stores workout history in `workout.db` inside the mounted data directory, rather than a plain text file.
+
+## Portainer / Docker stack
+
+The stack keeps the database in a named Docker volume, so your history survives rebuilds/restarts without losing data.
+
+```yaml
+version: "3.9"
+services:
+  workout-tracker:
+    image: workout-tracker:latest
+    container_name: workout-tracker
+    restart: unless-stopped
+    environment:
+      WORKOUT_DATA_DIR: /app/data
+    ports:
+      - "8080:8080"
+    volumes:
+      - workout-tracker-data:/app/data
+volumes:
+  workout-tracker-data:
+    driver: local
+```
 
 ## Features
 
 - 4-day Upper/Lower split based on the home-gym strength program in `src/resources/Home_Gym_Upper_Lower_Program.md`
 - Double-progression tracking with rep ranges and weight increases after reaching the top of the range
-- Persistent file storage in `workout_history.txt`
+- Persistent SQLite database storage in `workout.db`
 - Browser-based dashboard for tracking workouts over the local network

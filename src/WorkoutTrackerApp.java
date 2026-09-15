@@ -8,16 +8,26 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Statement;
 import java.time.DayOfWeek;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Executors;
 
 public class WorkoutTrackerApp {
     private static final int PORT = 8080;
-    private static final Path DATA_FILE = Paths.get(System.getenv().getOrDefault("WORKOUT_DATA_DIR", "."), "workout_history.txt");
+    private static final int DELoadCycleDays = 35;
+    private static final Path WORKOUT_DATA_DIR = Paths.get(System.getenv().getOrDefault("WORKOUT_DATA_DIR", "."));
+    private static final Path DATABASE_PATH = WORKOUT_DATA_DIR.resolve("workout.db");
+    private static final Path LEGACY_DATA_FILE = WORKOUT_DATA_DIR.resolve("workout_history.txt");
     private static final DateTimeFormatter FILE_DATE_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd");
 
     private final List<WorkoutEntry> workouts = new ArrayList<>();
@@ -54,6 +64,7 @@ public class WorkoutTrackerApp {
         json.append("{\"date\":\"").append(today.format(FILE_DATE_FORMAT)).append("\",");
         json.append("\"day\":\"").append(formatDayName(today.getDayOfWeek())).append("\",");
         json.append("\"routine\":\"").append(selectedRoutine).append("\",");
+        json.append("\"deload\":").append(shouldApplyScheduledDeload() ? "true" : "false").append(",");
         json.append("\"exercises\":[");
 
         for (int i = 0; i < templates.size(); i++) {
@@ -68,7 +79,8 @@ public class WorkoutTrackerApp {
             json.append("\"repCeiling\":").append(template.repCeiling).append(",");
             json.append("\"targetWeight\":").append(plan.targetWeight).append(",");
             json.append("\"lastWeight\":").append(plan.lastWeight).append(",");
-            json.append("\"lastMaxReps\":").append(plan.lastMaxReps).append("}");
+            json.append("\"lastMaxReps\":").append(plan.lastMaxReps).append(",");
+            json.append("\"deload\":").append(plan.deload ? "true" : "false").append("}");
         }
         json.append("]}");
 
@@ -224,7 +236,54 @@ public class WorkoutTrackerApp {
     }
 
     private void loadWorkouts() {
-        Path parent = DATA_FILE.getParent();
+        initializeDatabase();
+        workouts.clear();
+
+        try (Connection connection = getDatabaseConnection();
+             PreparedStatement statement = connection.prepareStatement(
+                     "SELECT id, entry_date, day_name FROM workout_sessions ORDER BY entry_date ASC, id ASC");
+             ResultSet resultSet = statement.executeQuery()) {
+            while (resultSet.next()) {
+                LocalDate date = LocalDate.parse(resultSet.getString("entry_date"), FILE_DATE_FORMAT);
+                WorkoutEntry entry = new WorkoutEntry(date, resultSet.getString("day_name"));
+
+                try (PreparedStatement exerciseStatement = connection.prepareStatement(
+                        "SELECT exercise_name, reps_csv FROM exercise_logs WHERE session_id = ? ORDER BY id ASC")) {
+                    exerciseStatement.setInt(1, resultSet.getInt("id"));
+                    try (ResultSet exerciseSet = exerciseStatement.executeQuery()) {
+                        while (exerciseSet.next()) {
+                            String exerciseName = exerciseSet.getString("exercise_name");
+                            String repsCsv = exerciseSet.getString("reps_csv");
+                            List<Integer> repsBySet = new ArrayList<>();
+                            if (repsCsv != null && !repsCsv.isBlank()) {
+                                String[] repValues = repsCsv.split("\\|");
+                                for (String repValue : repValues) {
+                                    String trimmed = repValue.trim();
+                                    if (!trimmed.isBlank()) {
+                                        repsBySet.add(Integer.parseInt(trimmed));
+                                    }
+                                }
+                            }
+                            if (!repsBySet.isEmpty()) {
+                                entry.exercises.add(new ExerciseLog(exerciseName, repsBySet));
+                            }
+                        }
+                    }
+                }
+                workouts.add(entry);
+            }
+        } catch (SQLException e) {
+            System.out.println("Could not read workout database: " + e.getMessage());
+        }
+
+        if (workouts.isEmpty() && Files.exists(LEGACY_DATA_FILE)) {
+            loadLegacyWorkouts();
+            saveWorkouts();
+        }
+    }
+
+    private void initializeDatabase() {
+        Path parent = DATABASE_PATH.getParent();
         if (parent != null && !Files.exists(parent)) {
             try {
                 Files.createDirectories(parent);
@@ -234,12 +293,25 @@ public class WorkoutTrackerApp {
             }
         }
 
-        if (!Files.exists(DATA_FILE)) {
+        try {
+            Class.forName("org.sqlite.JDBC");
+        } catch (ClassNotFoundException e) {
+            System.out.println("Could not load SQLite JDBC driver: " + e.getMessage());
             return;
         }
 
+        try (Connection connection = getDatabaseConnection();
+             Statement statement = connection.createStatement()) {
+            statement.executeUpdate("CREATE TABLE IF NOT EXISTS workout_sessions (id INTEGER PRIMARY KEY AUTOINCREMENT, entry_date TEXT NOT NULL, day_name TEXT NOT NULL)");
+            statement.executeUpdate("CREATE TABLE IF NOT EXISTS exercise_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id INTEGER NOT NULL, exercise_name TEXT NOT NULL, reps_csv TEXT NOT NULL, FOREIGN KEY(session_id) REFERENCES workout_sessions(id))");
+        } catch (SQLException e) {
+            System.out.println("Could not create workout database: " + e.getMessage());
+        }
+    }
+
+    private void loadLegacyWorkouts() {
         try {
-            List<String> lines = Files.readAllLines(DATA_FILE);
+            List<String> lines = Files.readAllLines(LEGACY_DATA_FILE);
             for (String line : lines) {
                 if (line == null || line.isBlank()) {
                     continue;
@@ -278,52 +350,130 @@ public class WorkoutTrackerApp {
                 workouts.add(entry);
             }
         } catch (IOException e) {
-            System.out.println("Could not read workout file: " + e.getMessage());
+            System.out.println("Could not read legacy workout file: " + e.getMessage());
         }
     }
 
     private void saveWorkouts() {
-        try {
-            Path parent = DATA_FILE.getParent();
-            if (parent != null && !Files.exists(parent)) {
-                Files.createDirectories(parent);
+        initializeDatabase();
+        try (Connection connection = getDatabaseConnection()) {
+            connection.setAutoCommit(false);
+            try (Statement resetStatement = connection.createStatement()) {
+                resetStatement.executeUpdate("DELETE FROM exercise_logs");
+                resetStatement.executeUpdate("DELETE FROM workout_sessions");
             }
 
-            List<String> lines = new ArrayList<>();
-            for (WorkoutEntry entry : workouts) {
-                StringBuilder line = new StringBuilder();
-                line.append(entry.date.format(FILE_DATE_FORMAT)).append("|").append(entry.dayName);
-                for (ExerciseLog log : entry.exercises) {
-                    line.append("|").append(log.exerciseName).append("~");
-                    for (int i = 0; i < log.repsBySet.size(); i++) {
-                        if (i > 0) {
-                            line.append("|");
+            try (PreparedStatement sessionStatement = connection.prepareStatement(
+                    "INSERT INTO workout_sessions (entry_date, day_name) VALUES (?, ?)", Statement.RETURN_GENERATED_KEYS);
+                 PreparedStatement exerciseStatement = connection.prepareStatement(
+                    "INSERT INTO exercise_logs (session_id, exercise_name, reps_csv) VALUES (?, ?, ?)")) {
+
+                for (WorkoutEntry entry : workouts) {
+                    sessionStatement.setString(1, entry.date.format(FILE_DATE_FORMAT));
+                    sessionStatement.setString(2, entry.dayName);
+                    sessionStatement.executeUpdate();
+
+                    try (ResultSet keys = sessionStatement.getGeneratedKeys()) {
+                        if (!keys.next()) {
+                            continue;
                         }
-                        line.append(log.repsBySet.get(i));
+                        int sessionId = keys.getInt(1);
+                        for (ExerciseLog log : entry.exercises) {
+                            StringBuilder repsBuilder = new StringBuilder();
+                            for (int i = 0; i < log.repsBySet.size(); i++) {
+                                if (i > 0) {
+                                    repsBuilder.append('|');
+                                }
+                                repsBuilder.append(log.repsBySet.get(i));
+                            }
+                            exerciseStatement.setInt(1, sessionId);
+                            exerciseStatement.setString(2, log.exerciseName);
+                            exerciseStatement.setString(3, repsBuilder.toString());
+                            exerciseStatement.addBatch();
+                        }
                     }
                 }
-                lines.add(line.toString());
+                exerciseStatement.executeBatch();
             }
-            Files.write(DATA_FILE, lines);
-        } catch (IOException e) {
-            System.out.println("Could not save workout file: " + e.getMessage());
+            connection.commit();
+        } catch (SQLException e) {
+            System.out.println("Could not save workout database: " + e.getMessage());
         }
+    }
+
+    private Connection getDatabaseConnection() throws SQLException {
+        return DriverManager.getConnection("jdbc:sqlite:" + DATABASE_PATH);
     }
 
     private ProgressionPlan recommendPlan(ExerciseTemplate template) {
         ExerciseLog last = findMostRecentLog(template.name);
         if (last == null) {
-            return new ProgressionPlan(template.baseWeight, 0.0, 0);
+            return new ProgressionPlan(template.baseWeight, 0.0, 0, false);
         }
 
-        double targetWeight = last.weight;
+        if (shouldApplyScheduledDeload()) {
+            double deloadWeight = roundToHalf(template.baseWeight * 0.6);
+            return new ProgressionPlan(deloadWeight, template.baseWeight, maxReps(last.repsBySet), true);
+        }
+
+        if (isStallPattern(template, last)) {
+            double reducedWeight = roundToHalf(template.baseWeight * 0.9);
+            return new ProgressionPlan(reducedWeight, template.baseWeight, maxReps(last.repsBySet), false);
+        }
+
+        double currentWeight = template.baseWeight;
         if (last.repsBySet.size() >= template.sets && allRepsAtOrAboveTarget(last.repsBySet, template.repFloor)) {
-            targetWeight = roundToHalf(last.weight + template.incrementLb);
-        } else if (last.repsBySet.size() < template.sets || hasAnyRepBelowTarget(last.repsBySet, template.repFloor)) {
-            targetWeight = roundToHalf(last.weight);
+            currentWeight = roundToHalf(currentWeight + template.incrementLb);
         }
 
-        return new ProgressionPlan(targetWeight, last.weight, maxReps(last.repsBySet));
+        return new ProgressionPlan(currentWeight, template.baseWeight, maxReps(last.repsBySet), false);
+    }
+
+    private boolean shouldApplyScheduledDeload() {
+        if (workouts.size() < 4) {
+            return false;
+        }
+
+        LocalDate firstWorkout = workouts.get(0).date;
+        LocalDate mostRecentWorkout = workouts.get(workouts.size() - 1).date;
+        long daysSinceCycleStart = ChronoUnit.DAYS.between(firstWorkout, mostRecentWorkout);
+        return daysSinceCycleStart >= DELoadCycleDays && (daysSinceCycleStart % DELoadCycleDays) < 7;
+    }
+
+    private boolean isStallPattern(ExerciseTemplate template, ExerciseLog lastLog) {
+        if (lastLog == null || lastLog.repsBySet.isEmpty()) {
+            return false;
+        }
+
+        List<ExerciseLog> recentLogs = findRecentLogsForExercise(template.name, 3);
+        if (recentLogs.size() < 2) {
+            return false;
+        }
+
+        int missedTargetCount = 0;
+        for (ExerciseLog log : recentLogs) {
+            if (log == null || log.repsBySet.isEmpty()) {
+                continue;
+            }
+            if (hasAnyRepBelowTarget(log.repsBySet, template.repFloor)) {
+                missedTargetCount++;
+            }
+        }
+        return missedTargetCount >= 2;
+    }
+
+    private List<ExerciseLog> findRecentLogsForExercise(String exerciseName, int limit) {
+        List<ExerciseLog> matches = new ArrayList<>();
+        for (int i = workouts.size() - 1; i >= 0 && matches.size() < limit; i--) {
+            WorkoutEntry entry = workouts.get(i);
+            for (int j = entry.exercises.size() - 1; j >= 0 && matches.size() < limit; j--) {
+                ExerciseLog log = entry.exercises.get(j);
+                if (log.exerciseName.equalsIgnoreCase(exerciseName)) {
+                    matches.add(log);
+                }
+            }
+        }
+        return matches;
     }
 
     private boolean allRepsAtOrAboveTarget(List<Integer> repsBySet, int targetReps) {
@@ -512,7 +662,8 @@ public class WorkoutTrackerApp {
                         const meta = document.getElementById('dayMeta');
                         const routineSelect = document.getElementById('routineSelect');
                         routineSelect.value = plan.routine || routine;
-                        meta.textContent = `${plan.day} • ${plan.date} • ${plan.routine}`;
+                        const deloadLabel = plan.deload ? ' • Deload week' : '';
+                        meta.textContent = `${plan.day} • ${plan.date} • ${plan.routine}${deloadLabel}`;
                         rows.innerHTML = '';
 
                         if (!plan.exercises || plan.exercises.length === 0) {
@@ -650,11 +801,13 @@ public class WorkoutTrackerApp {
         private final double targetWeight;
         private final double lastWeight;
         private final int lastMaxReps;
+        private final boolean deload;
 
-        public ProgressionPlan(double targetWeight, double lastWeight, int lastMaxReps) {
+        public ProgressionPlan(double targetWeight, double lastWeight, int lastMaxReps, boolean deload) {
             this.targetWeight = targetWeight;
             this.lastWeight = lastWeight;
             this.lastMaxReps = lastMaxReps;
+            this.deload = deload;
         }
     }
 }

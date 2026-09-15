@@ -5,6 +5,8 @@ services:
     image: workout-tracker:latest
     container_name: workout-tracker
     restart: unless-stopped
+    environment:
+      WORKOUT_DATA_DIR: /app/data
     ports:
       - "8080:8080"
     volumes:
